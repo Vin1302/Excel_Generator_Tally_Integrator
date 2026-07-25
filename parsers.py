@@ -65,8 +65,11 @@ def _detect_roles(df: pd.DataFrame) -> dict:
     roles = {}
     for col in df.columns:
         key = _norm_header(col)
-        if not key or "balance" in key:
+        if not key:
             continue
+        if "balance" in key:
+            roles.setdefault("balance", col)   # kept for the as-is sheet, never
+            continue                            # treated as a transaction amount
         if "date" in key:
             roles.setdefault("date", col)
         elif any(w in key for w in _KW_DESC):
@@ -163,24 +166,32 @@ def _dataframe_to_normalized(df: pd.DataFrame, source: str) -> pd.DataFrame:
             continue  # header leftovers / blank / total lines
 
         desc = ""
+        payee = ""
         if roles.get("description") is not None:
             raw_desc = str(row.get(roles["description"], "") or "").strip()
-            # Statements like ICICI put the payee on the FIRST line of the
-            # remarks cell and a long UPI/reference string on the lines below.
-            # Keep the first non-empty line so grouping keys off the payee.
             lines = [ln.strip() for ln in raw_desc.splitlines() if ln.strip()]
-            desc = lines[0] if lines else raw_desc
+            # payee   = first line (the counterparty) -> used for grouping
+            # desc    = full remark, newlines flattened -> shown as-is
+            payee = lines[0] if lines else raw_desc
+            desc = " ".join(lines) if lines else raw_desc
 
         amount, direction = _resolve_amount(row, roles)
         if amount == 0:
             continue
 
+        balance = None
+        if roles.get("balance") is not None:
+            b = _to_number(row.get(roles["balance"]))
+            balance = b if b != 0 else None
+
         out_rows.append(
             {
                 "date": date,
                 "description": desc,
+                "payee": payee or desc,
                 "amount": abs(amount),
                 "direction": direction,
+                "balance": balance,
                 "source": source,
             }
         )
@@ -389,8 +400,9 @@ def _pdf_page_via_text(page, source):
         desc = re.sub(r"\s{2,}", " ", desc).strip(" .-")
         direction = "paid" if amt < 0 else "received"
         rows.append(
-            {"date": date, "description": desc, "amount": abs(amt),
-             "direction": direction, "source": source}
+            {"date": date, "description": desc, "payee": desc,
+             "amount": abs(amt), "direction": direction,
+             "balance": None, "source": source}
         )
     return pd.DataFrame(rows, columns=_COLUMNS) if rows else _empty()
 
@@ -398,7 +410,7 @@ def _pdf_page_via_text(page, source):
 # --------------------------------------------------------------------------- #
 # Dispatcher
 # --------------------------------------------------------------------------- #
-_COLUMNS = ["date", "description", "amount", "direction", "source"]
+_COLUMNS = ["date", "description", "payee", "amount", "direction", "balance", "source"]
 
 
 def _empty() -> pd.DataFrame:
