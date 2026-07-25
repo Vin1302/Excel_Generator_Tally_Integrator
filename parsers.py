@@ -37,32 +37,49 @@ log = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", message="Could not infer format")
 
 # --------------------------------------------------------------------------- #
-# Header aliases: how we recognise columns regardless of what the bank calls
-# them. All comparisons are done in lower-case with spaces stripped.
+# Header recognition. We match by KEYWORDS CONTAINED IN the header (after
+# lower-casing and stripping spaces), so real-world names like
+# "Withdrawal Amount (INR)" or "Transaction Remarks" are recognised without
+# needing an exact match. Order of checks matters (see _detect_roles).
 # --------------------------------------------------------------------------- #
-DATE_HEADERS = {
-    "date", "txndate", "transactiondate", "valuedate", "postingdate",
-    "bookingdate", "date(valuedate)", "trandate",
-}
-DESC_HEADERS = {
-    "description", "narration", "particulars", "details", "remarks",
-    "transactiondetails", "transactionremarks", "chequeref", "reference",
-    "transactiondescription",
-}
-DEBIT_HEADERS = {
-    "debit", "withdrawal", "withdrawalamt", "withdrawalamt.", "dr",
-    "paidout", "debitamount", "withdrawals", "amountdebit", "debit(dr)",
-}
-CREDIT_HEADERS = {
-    "credit", "deposit", "depositamt", "depositamt.", "cr",
-    "paidin", "creditamount", "deposits", "amountcredit", "credit(cr)",
-}
-AMOUNT_HEADERS = {"amount", "value", "transactionamount", "amt"}
-TYPE_HEADERS = {"type", "drcr", "dr/cr", "crdr", "transactiontype", "indicator"}
+_KW_DESC = ("remark", "narration", "particular", "description", "detail")
+_KW_DEBIT = ("withdrawal", "debit", "paidout")
+_KW_CREDIT = ("deposit", "credit", "paidin")
+_KW_TYPE = ("drcr", "crdr", "indicator")
+
+# Keywords used only to locate the header ROW inside messy Excel/PDF sheets.
+_HEADER_ROW_KEYWORDS = (
+    "date", "remark", "narration", "particular", "description", "detail",
+    "withdrawal", "debit", "deposit", "credit", "amount", "balance",
+)
 
 
 def _norm_header(h) -> str:
     return re.sub(r"\s+", "", str(h).strip().lower())
+
+
+def _detect_roles(df: pd.DataFrame) -> dict:
+    """Assign each column a role (date / description / debit / credit / type /
+    amount) by looking for keywords inside the header text. A 'balance' column
+    is explicitly ignored so it's never mistaken for a transaction amount."""
+    roles = {}
+    for col in df.columns:
+        key = _norm_header(col)
+        if not key or "balance" in key:
+            continue
+        if "date" in key:
+            roles.setdefault("date", col)
+        elif any(w in key for w in _KW_DESC):
+            roles.setdefault("description", col)
+        elif any(w in key for w in _KW_DEBIT):        # before generic "amount"
+            roles.setdefault("debit", col)
+        elif any(w in key for w in _KW_CREDIT):       # before generic "amount"
+            roles.setdefault("credit", col)
+        elif "type" in key or any(w in key for w in _KW_TYPE):
+            roles.setdefault("type", col)
+        elif "amount" in key or key in {"amt", "value"}:
+            roles.setdefault("amount", col)
+    return roles
 
 
 def _to_number(x) -> float:
@@ -95,28 +112,37 @@ def _to_number(x) -> float:
 # --------------------------------------------------------------------------- #
 # Shared: a table-like DataFrame -> normalized rows
 # --------------------------------------------------------------------------- #
+def _dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Make column names unique. Real bank files often have blank or repeated
+    headers (e.g. two 'Amount' columns, or several empty ones); without this,
+    df[col] can return a whole DataFrame and pandas raises errors like
+    'cannot assemble with duplicate keys'."""
+    seen = {}
+    new_cols = []
+    for i, col in enumerate(df.columns):
+        name = "" if col is None else str(col).strip()
+        if name == "":
+            name = f"col_{i}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}.{seen[name]}"
+        else:
+            seen[name] = 0
+        new_cols.append(name)
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+
 def _dataframe_to_normalized(df: pd.DataFrame, source: str) -> pd.DataFrame:
     """Map an arbitrary bank table (already read into a DataFrame with a
     header row) onto the normalized schema."""
     if df is None or df.empty:
         return _empty()
 
-    # Map each real column to a role using the alias sets.
-    roles = {}
-    for col in df.columns:
-        key = _norm_header(col)
-        if key in DATE_HEADERS:
-            roles.setdefault("date", col)
-        elif key in DESC_HEADERS:
-            roles.setdefault("description", col)
-        elif key in DEBIT_HEADERS:
-            roles.setdefault("debit", col)
-        elif key in CREDIT_HEADERS:
-            roles.setdefault("credit", col)
-        elif key in AMOUNT_HEADERS:
-            roles.setdefault("amount", col)
-        elif key in TYPE_HEADERS:
-            roles.setdefault("type", col)
+    df = _dedupe_columns(df)   # <-- guarantees unique column labels
+
+    roles = _detect_roles(df)
 
     # If we couldn't find a date column by name, guess the most date-like one.
     if "date" not in roles:
@@ -138,7 +164,12 @@ def _dataframe_to_normalized(df: pd.DataFrame, source: str) -> pd.DataFrame:
 
         desc = ""
         if roles.get("description") is not None:
-            desc = str(row.get(roles["description"], "") or "").strip()
+            raw_desc = str(row.get(roles["description"], "") or "").strip()
+            # Statements like ICICI put the payee on the FIRST line of the
+            # remarks cell and a long UPI/reference string on the lines below.
+            # Keep the first non-empty line so grouping keys off the payee.
+            lines = [ln.strip() for ln in raw_desc.splitlines() if ln.strip()]
+            desc = lines[0] if lines else raw_desc
 
         amount, direction = _resolve_amount(row, roles)
         if amount == 0:
@@ -256,10 +287,10 @@ def parse_excel(path: str) -> pd.DataFrame:
 
 
 def _find_header_row(raw: pd.DataFrame) -> int:
-    keywords = DATE_HEADERS | DESC_HEADERS | DEBIT_HEADERS | CREDIT_HEADERS | AMOUNT_HEADERS
     for i in range(min(len(raw), 20)):
-        cells = {_norm_header(c) for c in raw.iloc[i].tolist()}
-        if cells & keywords:
+        row_text = " ".join(_norm_header(c) for c in raw.iloc[i].tolist())
+        hits = sum(1 for kw in _HEADER_ROW_KEYWORDS if kw in row_text)
+        if hits >= 2:   # a real header row mentions at least a couple of these
             return i
     return 0
 
@@ -267,15 +298,19 @@ def _find_header_row(raw: pd.DataFrame) -> int:
 # --------------------------------------------------------------------------- #
 # PDF
 # --------------------------------------------------------------------------- #
-# Tune this if a particular bank's tables don't extract cleanly. "lines" works
-# when the statement has ruled table borders; "text" works when it doesn't.
-_pdf_table_settings = {
-    "vertical_strategy": "lines",
-    "horizontal_strategy": "lines",
-}
+# We try each of these table-extraction strategies and keep whichever pulls the
+# most transactions. "lines" suits statements with ruled borders; "text" suits
+# borderless ones that align columns by whitespace. Trying all makes the reader
+# work across many bank layouts without manual tuning.
+_PDF_TABLE_STRATEGIES = [
+    {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
+    {"vertical_strategy": "text", "horizontal_strategy": "text"},
+    {"vertical_strategy": "lines", "horizontal_strategy": "text"},
+]
 
+# Date tokens: dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy, dd-MON-yy, yyyy-mm-dd, etc.
 _DATE_RE = re.compile(
-    r"\b(\d{1,2}[/-][A-Za-z0-9]{2,4}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})\b"
+    r"\b(\d{1,2}[./-][A-Za-z0-9]{2,4}[./-]\d{2,4}|\d{4}-\d{2}-\d{2})\b"
 )
 _AMOUNT_RE = re.compile(r"-?\(?\d[\d,]*\.\d{2}\)?")
 
@@ -304,20 +339,24 @@ def parse_pdf(path: str) -> pd.DataFrame:
 
 
 def _pdf_page_via_tables(page, source):
-    try:
-        tables = page.extract_tables(_pdf_table_settings)
-    except Exception:
-        tables = []
     best = _empty()
-    for table in tables or []:
-        if not table or len(table) < 2:
+    for settings in _PDF_TABLE_STRATEGIES:
+        try:
+            tables = page.extract_tables(settings)
+        except Exception:
             continue
-        header = [str(c or "") for c in table[0]]
-        body = table[1:]
-        df = pd.DataFrame(body, columns=header)
-        norm = _dataframe_to_normalized(df, source)
-        if len(norm) > len(best):
-            best = norm
+        for table in tables or []:
+            if not table or len(table) < 2:
+                continue
+            header = [str(c or "") for c in table[0]]
+            body = table[1:]
+            try:
+                df = pd.DataFrame(body, columns=header)
+            except Exception:
+                continue
+            norm = _dataframe_to_normalized(df, source)
+            if len(norm) > len(best):
+                best = norm
     return best
 
 
