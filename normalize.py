@@ -41,14 +41,16 @@ def clean_name(raw: str) -> str:
     """Reduce a raw narration to a comparable payee name."""
     if not raw:
         return "UNKNOWN"
-    s = str(raw).upper()
+    # If a multi-line remark slipped through, the payee is the first line.
+    first_line = str(raw).splitlines()[0] if str(raw).strip() else str(raw)
+    s = first_line.upper()
 
     # Remove dates like 12/03/2024, 2024-03-12, 12-MAR-24.
     s = re.sub(r"\b\d{1,2}[/-][A-Z0-9]{2,4}[/-]\d{2,4}\b", " ", s)
-    # Remove long digit runs (card/account/reference numbers).
-    s = re.sub(r"\b\d{4,}\b", " ", s)
-    # Remove mixed alphanumeric reference tokens (e.g. A1B2C3D4).
-    s = re.sub(r"\b(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{6,}\b", " ", s)
+    # Remove long digit runs (card/account/reference numbers), e.g. the 687972
+    # in "bajajpay.687972". Short trailing digits in a handle are kept so real
+    # payees like "siyabodadkar53" survive.
+    s = re.sub(r"\d{4,}", " ", s)
     # Replace any non-letter/number with a space.
     s = re.sub(r"[^A-Z0-9 ]", " ", s)
     # Drop noise words.
