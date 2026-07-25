@@ -41,15 +41,22 @@ BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 
 def build_workbook(df: pd.DataFrame, out_path: str) -> str:
-    """df must have columns: date, description, amount, direction, group."""
+    """df must have columns: date, description, payee, amount, direction,
+    balance, group."""
     wb = Workbook()
-    summary = wb.active
-    summary.title = "Summary"
+
+    # Sheet 1: the plain, as-is conversion of every transaction (what you see
+    # first when opening the file).
+    trans = wb.active
+    trans.title = "All Transactions"
+    _build_all_transactions_sheet(trans, df)
+
+    summary = wb.create_sheet("Summary")
 
     paid = df[df["direction"] == "paid"]
     recv = df[df["direction"] == "received"]
 
-    # Build the detail sheets first so we know which row each group starts on
+    # Build the detail sheets so we know which row each group starts on
     # (needed for the Summary hyperlinks).
     paid_anchors = _build_detail_sheet(wb, "Payments", paid, PAID_FILL,
                                        "Money Paid Out")
@@ -60,6 +67,48 @@ def build_workbook(df: pd.DataFrame, out_path: str) -> str:
 
     wb.save(out_path)
     return out_path
+
+
+def _build_all_transactions_sheet(ws, df):
+    """Flat, statement-style view: one row per transaction, full particulars,
+    with paid/received in separate columns and the running balance if present."""
+    ws.merge_cells("A1:E1")
+    c = ws["A1"]
+    c.value = "All Transactions"
+    c.font = TITLE_FONT
+    c.fill = TITLE_FILL
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 24
+
+    headers = ["Date", "Particulars", "Withdrawal", "Deposit", "Balance"]
+    for i, h in enumerate(headers, start=1):
+        cell = ws.cell(row=2, column=i, value=h)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.border = BORDER
+
+    has_balance = "balance" in df.columns
+    ordered = df.sort_values("date")
+    r = 3
+    for _, t in ordered.iterrows():
+        dcell = ws.cell(row=r, column=1, value=pd.to_datetime(t["date"]))
+        dcell.number_format = DATE_FMT
+        ws.cell(row=r, column=2, value=str(t.get("description", "")))
+        paid = float(t["amount"]) if t["direction"] == "paid" else None
+        recv = float(t["amount"]) if t["direction"] == "received" else None
+        if paid is not None:
+            pc = ws.cell(row=r, column=3, value=paid)
+            pc.number_format = MONEY_FMT
+        if recv is not None:
+            rc = ws.cell(row=r, column=4, value=recv)
+            rc.number_format = MONEY_FMT
+        if has_balance and pd.notna(t.get("balance")):
+            bc = ws.cell(row=r, column=5, value=float(t["balance"]))
+            bc.number_format = MONEY_FMT
+        r += 1
+
+    _autosize(ws, {1: 15, 2: 60, 3: 15, 4: 15, 5: 16})
+    ws.freeze_panes = "A3"
 
 
 # --------------------------------------------------------------------------- #
@@ -186,7 +235,7 @@ def _build_detail_sheet(wb, title, frame, fill, banner):
             acell = ws.cell(row=row, column=3, value=float(t["amount"]))
             acell.number_format = MONEY_FMT
             ws.row_dimensions[row].outline_level = 1
-            ws.row_dimensions[row].hidden = True   # start collapsed
+            ws.row_dimensions[row].hidden = False   # visible; +/- can collapse
             row += 1
 
     _autosize(ws, {1: 15, 2: 52, 3: 16})
