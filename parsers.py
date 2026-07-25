@@ -335,9 +335,16 @@ def parse_pdf(path: str) -> pd.DataFrame:
         return _empty()
 
     all_norm: List[pd.DataFrame] = []
+    anchors_holder = {"anchors": None}   # header positions, remembered across pages
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
-            df = _pdf_page_via_tables(page, source)
+            # 1) Position-aware reader (best for Withdrawal/Deposit/Balance
+            #    layouts like ICICI, HDFC, SBI, Axis savings statements).
+            df = _pdf_page_via_positions(page, source, anchors_holder)
+            # 2) Fall back to generic table extraction.
+            if df is None or df.empty:
+                df = _pdf_page_via_tables(page, source)
+            # 3) Last resort: line-by-line text.
             if df is None or df.empty:
                 df = _pdf_page_via_text(page, source)
             if df is not None and not df.empty:
@@ -347,6 +354,147 @@ def parse_pdf(path: str) -> pd.DataFrame:
         log.warning("%s: no transactions extracted from PDF", source)
         return _empty()
     return pd.concat(all_norm, ignore_index=True)
+
+
+# --------------------------------------------------------------------------- #
+# Position-aware extractor
+# --------------------------------------------------------------------------- #
+_MONEY_TOKEN_RE = re.compile(r"^-?\(?\d[\d,]*\.\d{2}\)?$")
+_DATE_TOKEN_RE = re.compile(r"^\d{1,2}[./-][A-Za-z0-9]{2,4}[./-]\d{2,4}$")
+
+
+def _is_money_token(tok: str) -> bool:
+    return bool(_MONEY_TOKEN_RE.match(str(tok).strip()))
+
+
+def _center(w) -> float:
+    return (w["x0"] + w["x1"]) / 2.0
+
+
+def _group_words_into_lines(words, tol: float = 3.0):
+    """Group extracted words into visual lines by their vertical position."""
+    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines, cur, cur_top = [], [], None
+    for w in words:
+        if cur_top is None or abs(w["top"] - cur_top) <= tol:
+            cur.append(w)
+            cur_top = w["top"] if cur_top is None else cur_top
+        else:
+            lines.append(sorted(cur, key=lambda x: x["x0"]))
+            cur, cur_top = [w], w["top"]
+    if cur:
+        lines.append(sorted(cur, key=lambda x: x["x0"]))
+    return lines
+
+
+def _find_amount_anchors(lines):
+    """Locate the header row and return the left-edge x of the Withdrawal,
+    Deposit and Balance columns. These define where amounts belong."""
+    for ln in lines:
+        joined = " ".join(w["text"].lower() for w in ln)
+        if "withdrawal" in joined and "deposit" in joined and "balance" in joined:
+            a = {}
+            for w in ln:
+                t = w["text"].lower()
+                if t.startswith("withdrawal"):
+                    a.setdefault("withdrawal", w["x0"])
+                elif t.startswith("deposit"):
+                    a.setdefault("deposit", w["x0"])
+                elif t.startswith("balance"):
+                    a.setdefault("balance", w["x0"])
+            if {"withdrawal", "deposit", "balance"} <= set(a):
+                return a
+    return None
+
+
+def _classify_amount(xc: float, anchors: dict):
+    """Which money column does an amount at x-center `xc` belong to?
+    Checked right-to-left so right-aligned numbers land correctly."""
+    if xc >= anchors["balance"] - 5:
+        return "balance"
+    if xc >= anchors["deposit"] - 5:
+        return "deposit"
+    if xc >= anchors["withdrawal"] - 5:
+        return "withdrawal"
+    return None
+
+
+def _pdf_page_via_positions(page, source, holder):
+    """Read a statement page using word coordinates. Requires a header row with
+    Withdrawal/Deposit/Balance columns (found on this or an earlier page)."""
+    try:
+        words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+    except Exception:
+        return _empty()
+    if not words:
+        return _empty()
+
+    lines = _group_words_into_lines(words)
+
+    anchors = _find_amount_anchors(lines)
+    if anchors:
+        holder["anchors"] = anchors
+    anchors = holder.get("anchors")
+    if not anchors:
+        return _empty()   # no Withdrawal/Deposit/Balance layout -> let fallbacks try
+
+    records = []
+    current = None
+    for ln in lines:
+        joined = " ".join(w["text"] for w in ln)
+        dm = _DATE_RE.search(joined)
+        moneys = [(w, _center(w)) for w in ln if _is_money_token(w["text"])]
+
+        is_start = bool(dm) and bool(moneys)
+        if is_start:
+            if current:
+                records.append(current)
+            wd = dep = bal = None
+            for w, xc in moneys:
+                role = _classify_amount(xc, anchors)
+                val = _to_number(w["text"])
+                if role == "withdrawal":
+                    wd = val
+                elif role == "deposit":
+                    dep = val
+                elif role == "balance":
+                    bal = val
+            # First-line remarks: words left of the Withdrawal column, minus the
+            # leading serial number and the date token.
+            rem = [w["text"] for w in ln if _center(w) < anchors["withdrawal"] - 5]
+            if rem and re.fullmatch(r"\d+", rem[0]):
+                rem = rem[1:]
+            rem = [t for t in rem if not _DATE_TOKEN_RE.match(t)]
+            remarks = " ".join(rem).strip()
+            date = pd.to_datetime(dm.group(1), errors="coerce", dayfirst=True)
+            current = {"date": date, "payee": remarks, "remarks": remarks,
+                       "wd": wd, "dep": dep, "bal": bal}
+        elif current is not None and not moneys:
+            # Continuation line (wrapped UPI/reference text) -> append to remarks.
+            cont = [w["text"] for w in ln if _center(w) < anchors["withdrawal"] - 5]
+            if cont:
+                current["remarks"] += " " + " ".join(cont)
+
+    if current:
+        records.append(current)
+
+    out = []
+    for r in records:
+        if pd.isna(r["date"]):
+            continue
+        if r["wd"] and abs(r["wd"]) > 0:
+            amount, direction = abs(r["wd"]), "paid"
+        elif r["dep"] and abs(r["dep"]) > 0:
+            amount, direction = abs(r["dep"]), "received"
+        else:
+            continue
+        desc = re.sub(r"\s{2,}", " ", r["remarks"]).strip()
+        out.append({
+            "date": r["date"], "description": desc,
+            "payee": r["payee"] or desc, "amount": amount,
+            "direction": direction, "balance": r["bal"], "source": source,
+        })
+    return pd.DataFrame(out, columns=_COLUMNS) if out else _empty()
 
 
 def _pdf_page_via_tables(page, source):
@@ -372,9 +520,8 @@ def _pdf_page_via_tables(page, source):
 
 
 def _pdf_page_via_text(page, source):
-    """Fallback: scan text lines. Grab the first date and the LAST money-looking
-    number on each line; text in between becomes the description. Direction is
-    guessed from sign only, so verify against a real statement and adjust."""
+    """Last-resort fallback: scan text lines. Grab the first date and the LAST
+    money-looking number on each line; text in between becomes the description."""
     try:
         text = page.extract_text() or ""
     except Exception:
