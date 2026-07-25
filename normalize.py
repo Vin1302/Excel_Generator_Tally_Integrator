@@ -86,7 +86,8 @@ def group_transactions(df: pd.DataFrame, threshold: int = 88) -> pd.DataFrame:
         have_rapidfuzz = False
 
     df = df.copy()
-    df["clean_name"] = df["description"].map(clean_name)
+    name_source = df["payee"] if "payee" in df.columns else df["description"]
+    df["clean_name"] = name_source.map(clean_name)
     df["group"] = df["clean_name"]
 
     if not have_rapidfuzz:
