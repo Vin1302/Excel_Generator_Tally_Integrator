@@ -319,9 +319,12 @@ _PDF_TABLE_STRATEGIES = [
     {"vertical_strategy": "lines", "horizontal_strategy": "text"},
 ]
 
-# Date tokens: dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy, dd-MON-yy, yyyy-mm-dd, etc.
+# Date tokens: dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy, dd-MON-yy, yyyy-mm-dd,
+# and the ``dd Mon yyyy`` form used by SBI account-statement PDFs.
 _DATE_RE = re.compile(
-    r"\b(\d{1,2}[./-][A-Za-z0-9]{2,4}[./-]\d{2,4}|\d{4}-\d{2}-\d{2})\b"
+    r"\b(\d{1,2}[./-][A-Za-z0-9]{2,4}[./-]\d{2,4}|"
+    r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}|\d{4}-\d{2}-\d{2})\b",
+    re.IGNORECASE,
 )
 _AMOUNT_RE = re.compile(r"-?\(?\d[\d,]*\.\d{2}\)?")
 
@@ -482,7 +485,11 @@ def parse_pdf(path: str) -> pd.DataFrame:
 # Position-aware extractor
 # --------------------------------------------------------------------------- #
 _MONEY_TOKEN_RE = re.compile(r"^-?\(?\d[\d,]*\.\d{2}\)?$")
-_DATE_TOKEN_RE = re.compile(r"^\d{1,2}[./-][A-Za-z0-9]{2,4}[./-]\d{2,4}$")
+_DATE_TOKEN_RE = re.compile(
+    r"^(?:\d{1,2}[./-][A-Za-z0-9]{2,4}[./-]\d{2,4}|"
+    r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}|\d{4}-\d{2}-\d{2})$",
+    re.IGNORECASE,
+)
 
 
 def _is_money_token(tok: str) -> bool:
@@ -597,8 +604,10 @@ def _pdf_page_via_positions(page, source, holder):
             rem = [w["text"] for w in ln if _center(w) < anchors["withdrawal"] - 5]
             if rem and re.fullmatch(r"\d+", rem[0]):
                 rem = rem[1:]
-            rem = [t for t in rem if not _DATE_TOKEN_RE.match(t)]
-            remarks = " ".join(rem).strip()
+            # A date written as ``01 Apr 2026`` is split into three PDF words,
+            # so remove date expressions after joining rather than testing each
+            # word independently.
+            remarks = _DATE_RE.sub("", " ".join(rem)).strip()
             date = pd.to_datetime(dm.group(1), errors="coerce", dayfirst=True)
             current = {"date": date, "payee": remarks, "remarks": remarks,
                        "wd": wd, "dep": dep, "bal": bal}
