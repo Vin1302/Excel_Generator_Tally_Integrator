@@ -1,0 +1,80 @@
+========================================================
+  BANK STATEMENT TOOL  —  SETUP ON WINDOWS (plain steps)
+========================================================
+
+You should have this exact folder structure after unzipping:
+
+  bank-statement-tool\
+    main.py
+    requirements.txt
+    build.bat
+    SETUP.txt            <- this file
+    README.md
+    config\
+      ledger_map.csv
+    core\
+      __init__.py
+      parsers.py
+      normalize.py
+      excel_report.py
+      tally_export.py
+      pipeline.py
+
+If you do NOT see the "core" folder, the unzip did not finish — unzip again
+and make sure you extract the WHOLE zip, not just one file.
+
+--------------------------------------------------------
+STEP 1  — Install Python (only once, only on your machine)
+--------------------------------------------------------
+- Download Python 3.12 (64-bit) from  https://www.python.org/downloads/
+- On the FIRST installer screen, TICK the box:
+      [x] Add python.exe to PATH
+- Then click Install.
+
+Check it worked: open Command Prompt and type
+      python --version
+It should print  Python 3.12.x
+
+--------------------------------------------------------
+STEP 2  — Open a terminal INSIDE this folder
+--------------------------------------------------------
+- Open this "bank-statement-tool" folder in File Explorer.
+- Click the address bar at the top, type   cmd   and press Enter.
+- A black window opens, already in this folder. Use THIS window below.
+
+(Confirm you're in the right place: type  dir  and press Enter.
+ You must see  main.py  AND a  core  folder in the list.)
+
+--------------------------------------------------------
+STEP 3  — Set up and test  (run these one at a time)
+--------------------------------------------------------
+      python -m venv .venv
+      .venv\Scripts\activate
+      pip install -r requirements.txt
+      python main.py
+
+The app window should open. If it does, everything works.
+
+NOTE: if  .venv\Scripts\activate  gives a "running scripts is disabled"
+error, you are in PowerShell. Either use plain Command Prompt (cmd), or run
+this once in PowerShell and try again:
+      Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+
+--------------------------------------------------------
+STEP 4  — Build the .exe
+--------------------------------------------------------
+Double-click  build.bat
+      OR run:
+      pip install pyinstaller
+      pyinstaller --noconfirm --onefile --windowed --name "BankStatementTool" --collect-all pdfplumber --collect-all pdfminer --add-data "config;config" main.py
+
+Your finished app appears at:  dist\BankStatementTool.exe
+
+Give the end user that .exe AND the "config" folder next to it.
+
+--------------------------------------------------------
+COMMON PROBLEM:  "No module named core"
+--------------------------------------------------------
+This means the terminal is NOT in the folder that contains main.py + core.
+Fix: redo STEP 2 (address bar -> cmd) so the terminal opens inside the
+folder where  dir  shows both  main.py  and  core.
