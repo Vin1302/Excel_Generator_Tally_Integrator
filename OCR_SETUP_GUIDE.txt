@@ -1,0 +1,66 @@
+======================================================
+SETUP GUIDE: Enable OCR for Image-Only PDFs
+======================================================
+
+The tool now supports OCR (Optical Character Recognition) to extract text from
+scanned/image-based bank PDFs. This is a 3-step process:
+
+STEP 1: Install Tesseract-OCR (the system tool)
+──────────────────────────────────────────────
+
+Windows:
+  1. Download installer from:
+	 https://github.com/UB-Mannheim/tesseract/wiki/Downloads
+
+  2. Run the installer (choose default location: C:\Program Files\Tesseract-OCR)
+
+  3. Verify installation by opening PowerShell and running:
+	 tesseract --version
+
+Mac:
+  brew install tesseract
+
+Linux (Ubuntu/Debian):
+  sudo apt-get install tesseract-ocr
+
+
+STEP 2: Install Python OCR Library
+──────────────────────────────────
+
+The tool already includes pytesseract in requirements.txt.
+If you need to install manually:
+
+  python -m pip install pytesseract -q
+
+
+STEP 3: Test OCR Extraction
+───────────────────────────
+
+Run the diagnose script again:
+
+  python diagnose_pdf.py "C:\path\to\your\statement.pdf"
+
+Or run the tool normally - it will automatically:
+  1. Try text extraction (for searchable PDFs)
+  2. Try table extraction
+  3. Try line-by-line text parsing
+  4. Fall back to OCR (for scanned images)
+
+
+TROUBLESHOOTING
+──────────────
+
+If OCR still doesn't work:
+
+  a) Verify Tesseract is installed:
+	 Open PowerShell and run: tesseract --version
+
+  b) If Tesseract is not in PATH, add it manually:
+	 - Open System Properties > Environment Variables
+	 - Add to PATH: C:\Program Files\Tesseract-OCR
+	 - Restart PowerShell
+
+  c) Check the logs for error messages:
+	 The tool will show if pytesseract or tesseract can't be found
+
+======================================================
