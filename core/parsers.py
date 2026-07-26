@@ -42,10 +42,70 @@ warnings.filterwarnings("ignore", message="Could not infer format")
 # "Withdrawal Amount (INR)" or "Transaction Remarks" are recognised without
 # needing an exact match. Order of checks matters (see _detect_roles).
 # --------------------------------------------------------------------------- #
-_KW_DESC = ("remark", "narration", "particular", "description", "detail")
-_KW_DEBIT = ("withdrawal", "debit", "paidout")
-_KW_CREDIT = ("deposit", "credit", "paidin")
-_KW_TYPE = ("drcr", "crdr", "indicator")
+# -----------------------------------------------------------------------------
+# UNIVERSAL HEADER KEYWORDS
+# -----------------------------------------------------------------------------
+
+_KW_DATE = (
+    "date",
+    "txn date",
+    "transaction date",
+    "value date",
+    "post date",
+    "posting date",
+)
+
+_KW_DESC = (
+    "remarks",
+    "remark",
+    "narration",
+    "particular",
+    "particulars",
+    "description",
+    "details",
+    "detail",
+    "transaction details",
+)
+
+_KW_REFERENCE = (
+    "ref",
+    "reference",
+    "ref no",
+    "cheque",
+    "cheque no",
+    "instrument",
+    "instrument no",
+)
+
+_KW_DEBIT = (
+    "withdrawal",
+    "withdraw",
+    "withdrawal amt",
+    "debit",
+    "dr",
+    "paid out",
+)
+
+_KW_CREDIT = (
+    "deposit",
+    "credit",
+    "cr",
+    "paid in",
+)
+
+_KW_BALANCE = (
+    "balance",
+    "closing balance",
+    "running balance",
+    "available balance",
+)
+
+_KW_AMOUNT = (
+    "amount",
+    "txn amount",
+    "transaction amount",
+    "amt",
+)
 
 # Header abbreviations seen in bank-statement PDFs.  These are deliberately
 # kept separate from the general keywords above: a lone "dr" or "cr" is only
@@ -64,59 +124,131 @@ def _norm_header(h) -> str:
     return re.sub(r"\s+", "", str(h).strip().lower())
 
 
-def _detect_roles(df: pd.DataFrame) -> dict:
-    """Assign each column a role (date / description / debit / credit / type /
-    amount) by looking for keywords inside the header text. A 'balance' column
-    is explicitly ignored so it's never mistaken for a transaction amount."""
+def _detect_roles(df: pd.DataFrame):
+
     roles = {}
+
     for col in df.columns:
+
         key = _norm_header(col)
-        if not key:
+
+        key = (
+            key.replace("₹", "")
+               .replace("rs.", "")
+               .replace("rs", "")
+               .replace("_", "")
+               .strip()
+        )
+
+        # ---------------- DATE ----------------
+
+        if "valuedate" in key:
+            roles["date"] = col
             continue
-        if "balance" in key:
-            roles.setdefault("balance", col)   # kept for the as-is sheet, never
-            continue                            # treated as a transaction amount
-        if "date" in key:
+
+        if "transactiondate" in key:
             roles.setdefault("date", col)
-        elif any(w in key for w in _KW_DESC):
+            continue
+
+        if "postdate" in key:
+            roles.setdefault("post_date", col)
+            continue
+
+        if any(x.replace(" ","") in key for x in _KW_DATE):
+            roles.setdefault("date", col)
+            continue
+
+        # ---------------- DESCRIPTION ----------------
+
+        if any(x.replace(" ","") in key for x in _KW_DESC):
             roles.setdefault("description", col)
-        elif any(w in key for w in _KW_DEBIT):        # before generic "amount"
+            continue
+
+        # ---------------- REFERENCE ----------------
+
+        if any(x.replace(" ","") in key for x in _KW_REFERENCE):
+            roles.setdefault("reference", col)
+            continue
+
+        # ---------------- DEBIT ----------------
+
+        if any(x.replace(" ","") in key for x in _KW_DEBIT):
             roles.setdefault("debit", col)
-        elif any(w in key for w in _KW_CREDIT):       # before generic "amount"
+            continue
+
+        # ---------------- CREDIT ----------------
+
+        if any(x.replace(" ","") in key for x in _KW_CREDIT):
             roles.setdefault("credit", col)
-        elif "type" in key or any(w in key for w in _KW_TYPE):
-            roles.setdefault("type", col)
-        elif "amount" in key or key in {"amt", "value"}:
+            continue
+
+        # ---------------- BALANCE ----------------
+
+        if any(x.replace(" ","") in key for x in _KW_BALANCE):
+            roles.setdefault("balance", col)
+            continue
+
+        # ---------------- AMOUNT ----------------
+
+        if any(x.replace(" ","") in key for x in _KW_AMOUNT):
             roles.setdefault("amount", col)
+
     return roles
 
+def _to_number(value):
 
-def _to_number(x) -> float:
-    """Parse a money value that may contain commas, currency symbols,
-    parentheses (negative) or trailing Dr/Cr markers. Blank -> 0.0."""
-    if x is None:
+    if value is None:
         return 0.0
-    s = str(x).strip()
-    if s == "" or s.lower() in {"nan", "none", "-"}:
+
+    if pd.isna(value):
         return 0.0
+
+    s = str(value).strip()
+
+    if s == "":
+        return 0.0
+
+    if s.lower() in {"nan", "none", "-", "--"}:
+        return 0.0
+
+    # Remove common currency markers
+    s = (
+        s.replace("₹", "")
+         .replace("Rs.", "")
+         .replace("Rs", "")
+         .replace("INR", "")
+         .replace(",", "")
+         .strip()
+    )
+
     negative = False
+
+    # Parentheses indicate a negative amount
     if s.startswith("(") and s.endswith(")"):
         negative = True
-        s = s[1:-1]
-    if s.lower().endswith("dr"):
+        s = s[1:-1].strip()
+
+    lower = s.lower()
+
+    if lower.endswith("dr"):
         negative = True
-        s = s[:-2]
-    elif s.lower().endswith("cr"):
-        s = s[:-2]
-    s = re.sub(r"[^0-9.\-]", "", s)   # drop currency symbols, commas, spaces
+        s = s[:-2].strip()
+
+    elif lower.endswith("cr"):
+        s = s[:-2].strip()
+
+    # Remove anything that's not part of a number
+    s = re.sub(r"[^0-9.\-]", "", s)
+
     if s in {"", ".", "-"}:
         return 0.0
+
     try:
-        val = float(s)
+        value = float(s)
     except ValueError:
         return 0.0
-    return -abs(val) if negative else val
 
+    return -abs(value) if negative else value
 
 # --------------------------------------------------------------------------- #
 # Shared: a table-like DataFrame -> normalized rows
@@ -171,15 +303,21 @@ def _dataframe_to_normalized(df: pd.DataFrame, source: str) -> pd.DataFrame:
         if pd.isna(date):
             continue  # header leftovers / blank / total lines
 
-        desc = ""
-        payee = ""
-        if roles.get("description") is not None:
-            raw_desc = str(row.get(roles["description"], "") or "").strip()
-            lines = [ln.strip() for ln in raw_desc.splitlines() if ln.strip()]
-            # payee   = first line (the counterparty) -> used for grouping
-            # desc    = full remark, newlines flattened -> shown as-is
-            payee = lines[0] if lines else raw_desc
-            desc = " ".join(lines) if lines else raw_desc
+  desc = ""
+payee = ""
+
+if roles.get("description") is not None:
+    desc = str(row.get(roles["description"], "")).strip()
+
+if roles.get("reference") is not None:
+    ref = str(row.get(roles["reference"], "")).strip()
+
+    if ref and ref.lower() != "nan":
+        desc += " " + ref
+
+desc = re.sub(r"\s+", " ", desc).strip()
+
+payee = desc
 
         amount, direction = _resolve_amount(row, roles)
         if amount == 0:
@@ -535,6 +673,88 @@ def _amount_header_role(text: str):
         return "balance"
     return None
 
+def _detect_pdf_columns(lines):
+    """
+    Detect every visible PDF column by reading the header text.
+    Returns
+
+    {
+        "date":120,
+        "post_date":180,
+        "description":250,
+        "reference":420,
+        "debit":620,
+        "credit":760,
+        "balance":900
+    }
+    """
+
+    for start in range(min(len(lines), 12)):
+
+        words = []
+
+        # SBI headers often wrap over several lines
+        for ln in lines[start:start+6]:
+            words.extend(ln)
+
+        cols = {}
+
+        for w in words:
+
+            txt = (
+                w["text"]
+                .lower()
+                .replace("₹","")
+                .replace("rs.","")
+                .replace("rs","")
+                .strip()
+            )
+
+            x = w["x0"]
+
+            if "value" in txt and "date" in txt:
+                cols["date"] = x
+
+            elif "transaction" in txt and "date" in txt:
+                cols.setdefault("date",x)
+
+            elif "post" in txt:
+                cols["post_date"] = x
+
+            elif txt in {
+                "details",
+                "detail",
+                "remarks",
+                "description",
+                "narration",
+                "particulars"
+            }:
+                cols["description"] = x
+
+            elif "ref" in txt or "cheque" in txt:
+                cols["reference"] = x
+
+            elif txt in {
+                "withdrawal",
+                "debit",
+                "dr"
+            }:
+                cols["debit"] = x
+
+            elif txt in {
+                "deposit",
+                "credit",
+                "cr"
+            }:
+                cols["credit"] = x
+
+            elif "balance" in txt:
+                cols["balance"] = x
+
+        if "date" in cols and "balance" in cols:
+            return cols
+
+    return None
 
 def _find_amount_anchors(lines):
     """Locate Withdrawal/Debit, Deposit/Credit and Balance column headings.
@@ -562,16 +782,26 @@ def _find_amount_anchors(lines):
     return None
 
 
-def _classify_amount(xc: float, anchors: dict):
-    """Which money column does an amount at x-center `xc` belong to?
-    Checked right-to-left so right-aligned numbers land correctly."""
-    if xc >= anchors["balance"] - 5:
-        return "balance"
-    if xc >= anchors["deposit"] - 5:
-        return "deposit"
-    if xc >= anchors["withdrawal"] - 5:
-        return "withdrawal"
-    return None
+def _find_column(x, anchors):
+    """
+    Returns which detected column an x-coordinate belongs to.
+    """
+
+    ordered = sorted(
+        anchors.items(),
+        key=lambda x: x[1]
+    )
+
+    previous = ordered[0][0]
+
+    for name,pos in ordered:
+
+        if x < pos:
+            return previous
+
+        previous = name
+
+    return ordered[-1][0]
 
 
 def _pdf_page_via_positions(page, source, holder):
@@ -586,7 +816,7 @@ def _pdf_page_via_positions(page, source, holder):
 
     lines = _group_words_into_lines(words)
 
-    anchors = _find_amount_anchors(lines)
+   anchors = _detect_pdf_columns(lines)
     if anchors:
         holder["anchors"] = anchors
     anchors = holder.get("anchors")
@@ -597,6 +827,19 @@ def _pdf_page_via_positions(page, source, holder):
     current = None
     for ln in lines:
         joined = " ".join(w["text"] for w in ln)
+        lower = joined.lower()
+
+if (
+    "value date" in lower
+    or "post date" in lower
+    or "details" in lower
+    or "description" in lower
+    or "withdrawal" in lower
+    or "debit" in lower
+    or "credit" in lower
+    or "balance" in lower
+):
+    continue
         dm = _DATE_RE.search(joined)
         moneys = [(w, _center(w)) for w in ln if _is_money_token(w["text"])]
 
@@ -606,32 +849,61 @@ def _pdf_page_via_positions(page, source, holder):
                 records.append(current)
             wd = dep = bal = None
             for w, xc in moneys:
-                role = _classify_amount(xc, anchors)
+                role = _find_column(xc, anchors)
                 val = _to_number(w["text"])
-                if role == "withdrawal":
-                    wd = val
-                elif role == "deposit":
-                    dep = val
-                elif role == "balance":
-                    bal = val
+              if role in ("withdrawal", "debit"):
+    wd = val
+
+elif role in ("deposit", "credit"):
+    dep = val
+
+elif role == "balance":
+    bal = val
             # First-line remarks: words left of the Withdrawal column, minus the
             # leading serial number and the date token.
-            rem = [w["text"] for w in ln if _center(w) < anchors["withdrawal"] - 5]
-            if rem and re.fullmatch(r"\d+", rem[0]):
-                rem = rem[1:]
-            # A date written as ``01 Apr 2026`` is split into three PDF words,
-            # so remove date expressions after joining rather than testing each
-            # word independently.
-            remarks = _DATE_RE.sub("", " ".join(rem)).strip()
+          desc_words = []
+ref_words = []
+
+for w in ln:
+    x = _center(w)
+
+    # Description column
+    if anchors.get("description") and anchors.get("debit"):
+        if anchors["description"] <= x < anchors["debit"]:
+            desc_words.append(w["text"])
+
+    # Reference column (if present)
+    if anchors.get("reference") and anchors.get("debit"):
+        if anchors["reference"] <= x < anchors["debit"]:
+            ref_words.append(w["text"])
+
+remarks = " ".join(desc_words)
+
+if ref_words:
+    remarks += " " + " ".join(ref_words)
+
+remarks = _DATE_RE.sub("", remarks)
+remarks = re.sub(r"\s+", " ", remarks).strip()
             date = pd.to_datetime(dm.group(1), errors="coerce", dayfirst=True)
             current = {"date": date, "payee": remarks, "remarks": remarks,
                        "wd": wd, "dep": dep, "bal": bal}
-        elif current is not None and not moneys:
+       elif current is not None:
             # Continuation line (wrapped UPI/reference text) -> append to remarks.
-            cont = [w["text"] for w in ln if _center(w) < anchors["withdrawal"] - 5]
-            if cont:
-                current["remarks"] += " " + " ".join(cont)
+            cont = []
 
+for w in ln:
+    x = _center(w)
+
+    # Only append words from the narration area.
+    if (
+        anchors.get("description") is not None
+        and anchors.get("debit") is not None
+        and anchors["description"] <= x < anchors["debit"]
+    ):
+        cont.append(w["text"])
+
+if cont:
+    current["remarks"] += " " + " ".join(cont)
     if current:
         records.append(current)
 
