@@ -47,6 +47,12 @@ _KW_DEBIT = ("withdrawal", "debit", "paidout")
 _KW_CREDIT = ("deposit", "credit", "paidin")
 _KW_TYPE = ("drcr", "crdr", "indicator")
 
+# Header abbreviations seen in bank-statement PDFs.  These are deliberately
+# kept separate from the general keywords above: a lone "dr" or "cr" is only
+# meaningful when locating column headings, not when interpreting narration.
+_HEADER_DEBIT_ABBRS = {"dr", "drs"}
+_HEADER_CREDIT_ABBRS = {"cr", "crs"}
+
 # Keywords used only to locate the header ROW inside messy Excel/PDF sheets.
 _HEADER_ROW_KEYWORDS = (
     "date", "remark", "narration", "particular", "description", "detail",
@@ -516,34 +522,43 @@ def _group_words_into_lines(words, tol: float = 3.0):
     return lines
 
 
-def _find_amount_anchors(lines):
-    """Locate the header row and return the left-edge x of the Withdrawal,
-    Deposit and Balance columns. These define where amounts belong.
-    Supports both 'Withdrawal/Deposit' and 'Debit/Credit' variants."""
-    for ln in lines:
-        joined = " ".join(w["text"].lower() for w in ln)
-        # Check for debit-like keyword (withdrawal, debit, paidout)
-        has_debit_kw = any(kw in joined for kw in _KW_DEBIT)
-        # Check for credit-like keyword (deposit, credit, paidin)
-        has_credit_kw = any(kw in joined for kw in _KW_CREDIT)
-        # Check for balance
-        has_balance = "balance" in joined
+def _amount_header_role(text: str):
+    """Return the amount-column role named by one PDF header word, if any."""
+    key = re.sub(r"[^a-z]", "", str(text).lower())
+    if not key:
+        return None
+    if key in _HEADER_DEBIT_ABBRS or any(kw in key for kw in _KW_DEBIT):
+        return "withdrawal"
+    if key in _HEADER_CREDIT_ABBRS or any(kw in key for kw in _KW_CREDIT):
+        return "deposit"
+    if "balance" in key or key in {"bal", "balrs"}:
+        return "balance"
+    return None
 
-        if has_debit_kw and has_credit_kw and has_balance:
-            a = {}
-            for w in ln:
-                t = w["text"].lower()
-                # Check if word contains any debit keyword (handles "₹ debit", "debit", etc.)
-                if any(kw in t for kw in _KW_DEBIT):
-                    a.setdefault("withdrawal", w["x0"])
-                # Check if word contains any credit keyword
-                elif any(kw in t for kw in _KW_CREDIT):
-                    a.setdefault("deposit", w["x0"])
-                # Check for balance
-                elif "balance" in t:
-                    a.setdefault("balance", w["x0"])
-            if {"withdrawal", "deposit", "balance"} <= set(a):
-                return a
+
+def _find_amount_anchors(lines):
+    """Locate Withdrawal/Debit, Deposit/Credit and Balance column headings.
+
+    PDF producers often wrap SBI's header over several visual lines (for
+    example, ``Debit Credit`` on one line and ``Balance`` below it).  Search a
+    small adjacent-line window rather than requiring all labels on one line.
+    """
+    for start in range(len(lines)):
+        words = [w for ln in lines[start:start + 3] for w in ln]
+        roles = {}
+        for w in words:
+            role = _amount_header_role(w["text"])
+            if role:
+                # A heading can be split into multiple words; its left-most
+                # word is the correct column boundary.
+                roles[role] = min(roles.get(role, w["x0"]), w["x0"])
+
+        if {"withdrawal", "deposit", "balance"} <= set(roles):
+            # The layouts handled by this coordinate reader place debit,
+            # credit and balance from left to right.  Reject narration that
+            # happens to mention the same words in another order.
+            if roles["withdrawal"] < roles["deposit"] < roles["balance"]:
+                return roles
     return None
 
 
